@@ -1,16 +1,34 @@
 #!/usr/bin/env bash
+#
+# Setups up an interface as dhcp server and allows for a device to be plugged
+# into a layer 2 switch or device (e.g. raspberry pi)
 
-declare -a adapters
-declare -i choice
+
+###############################################################################
+# Globals:
+#   ADAPTERS
+#   CHOICE
+#   DHCP_CONFIG_PATH
+#   REQUIRED_PROGRAMS
+#   DHCP_CONFIG
+###############################################################################
+
+declare -a ADAPTERS
+declare -i CHOICE
 
 # Location of config file
-declare -r dhcp_config="./udhcpd.conf"
+declare -r DHCP_CONFIG_PATH="./udhcpd.conf"
 
 # List of required installed programs
-declare -a required_programs=("udhcpd")
+declare -a REQUIRED_PROGRAMS=("udhcpd")
+
+# CONFIG
+declare -r IP_ADDR="172.168.10.1"
+declare -r NMASK="255.255.255.0"
+declare -r BMASK="172.168.10.255"
 
 #config file
-declare -r conf="
+declare -r DHCP_CONFIG="
 # range
 start 172.168.10.100
 end 172.168.10.200
@@ -25,20 +43,25 @@ option router 172.168.10.1
 option lease 43200
 option dns 172.168.10.1
 option domain local
+
+pidfile /var/run/udhcpd.pid
 "
 
-# Capture Ctrl-C
-trap ctrlC INT
+RUN_IN_FOREGROUND="-f"
+
+# Capture control-C
+trap control_c INT
 
 ###############################################################################
-# FUNCTION: checkInstall
+# FUNCTION: check_install
 # DESCRIPTION: checks for applications and for config file
 ###############################################################################
-function checkInstall() {
+function check_install() {
 
     install_choice="y"
-    for program in ${required_programs[@]}; do
+    for program in ${REQUIRED_PROGRAMS[@]}; do
         if ! [ -x "$(command -v ${program})" ]; then
+
             echo "Error: ${program} is not installed." >&2
             printf "Would you like to attempt to install ${program}?\n"
 
@@ -50,6 +73,7 @@ function checkInstall() {
 
             if [ $install_choice == "y" ]; then
                 printf "installing %s\n" $program
+
                 apt-get install ${program} --assume-yes
 
                 if [ $? != 0 ]; then
@@ -63,13 +87,16 @@ function checkInstall() {
         fi
     done
 
+    # not sure if this is needed
+    # disable udhcpd from running as a service
+    update-rc.d udhcpd remove
 
     # If config doesn't exist install it
-    if [ ! -f ${dhcp_config} ]; then
-        touch ${dhcp_config}
-        > ${dhcp_config}
+    if [ ! -f ${DHCP_CONFIG_PATH} ]; then
+        touch ${DHCP_CONFIG_PATH}
+        > ${DHCP_CONFIG_PATH}
 
-        echo -e "$conf" >> ${dhcp_config}
+        echo -e "${DHCP_CONFIG}" >> ${DHCP_CONFIG_PATH}
     fi
 
 }
@@ -81,11 +108,11 @@ function checkInstall() {
 function uninstall() {
 
     # Remove config
-    rm ${dhcp_config}
+    rm ${DHCP_CONFIG_PATH}
 
     # Uninstall programs
     uninstall_choice="y"
-    for program in ${required_programs[@]}; do
+    for program in ${REQUIRED_PROGRAMS[@]}; do
         if  [ -x "$(command -v ${program})" ]; then
             printf "${program} is installed.\n"
             printf "Would you like to attempt to uninstall ${program}?\n"
@@ -126,63 +153,88 @@ function menu() {
 
 
     printf "Select Adapter:\n"
-    adapters=($(ls "/sys/class/net"))
+    ADAPTERS=($(ls "/sys/class/net"))
 
     id=0
-    for adapter in ${adapters[*]}; do
+    for adapter in ${ADAPTERS[@]}; do
         printf "\t[%d] %s\n" ${id} ${adapter}
         let id=$id+1
     done
 
     printf "\n"
-    printf "Default: ${adapters[0]}\n"
-    read -p "Choice: " choice
+    printf "Default: ${ADAPTERS[0]}\n"
+    read -p "Choice: " CHOICE
+    printf "\n"
 
     #Set Default to 0
-    choice=${choice:0}
+    CHOICE=${CHOICE:0}
 }
 
 ###############################################################################
-# FUNCTION: ctrlFirewall
+# FUNCTION: kill_existing_dhcp_server
+# DESCRIPTION: checks for an existing dhcp server
+###############################################################################
+function kill_existing_dhcp_server() {
+    # kill dhcp client
+    if [ -f "/var/run/udhcpd.${adapter}.pid" ]; then
+        #try to kill don't care about output
+        kill `cat /var/run/udhcpd.${adapter}.pid` > /dev/null 2>&1
+        rm "/var/run/udhcpd.${adapter}.pid" > /dev/null 2>&1
+    fi
+}
+
+
+###############################################################################
+# FUNCTION: control_firewall
+# ARGUMENTS: STATE, PORT
 # DESCRIPTION: opens and allows traffic through firewall for dhcp
 ###############################################################################
-function ctrlFirewall() {
+function control_firewall() {
     # 67 : dhcp
-    ufw $1 67/udp
+    ufw $1 $2/udp
     ufw reload
     ufw status
 }
 
 
 ###############################################################################
-# FUNCTION: ctrlC
-# DESCRIPTION: captures the ctrl_c from user to begin cleanup
+# FUNCTION: control_c
+# DESCRIPTION: captures the control_c from user to begin cleanup
 ###############################################################################
-function ctrlC() {
-    ctrlFirewall "deny"
-    ctrlDhcp "stop"
+function control_c() {
+    control_firewall "deny" 67
+    control_dhcp "stop"
     exit
 }
 
 ###############################################################################
-# FUNCTION: ctrlDhcp
+# FUNCTION: control_dhcp
+# ARGUMENTS START/STOP
 # DESCRIPTION: checks for applications and for config file
 ###############################################################################
-function ctrlDhcp() {
+function control_dhcp() {
 
-    adapter=${adapters[choice]}
+    adapter=${ADAPTERS[CHOICE]}
+
+    kill_existing_dhcp_server
 
     if [ $1 == "start" ]; then
         # configure interface
-        ifconfig ${adapter} 172.168.10.1 netmask 255.255.255.0 broadcast 172.168.10.255 up
+        ifconfig ${adapter} ${IP_ADDR} netmask ${NMASK} broadcast ${BMASK} up
 
-        # Start the DHCP Server Process once the Interface is Ready with the IP Add
-        udhcpd ${dhcp_config} -f
-    elif [ $1 == "stop" ]; then
-        # kill dhcp client
-        if [ -f /var/run/udhcpc.${adapter}.pid ]; then
-            kill `cat /var/run/udhcpc.${adapter}.pid`
+        printf "\n\nYour IP Address: ${IP_ADDR}\n\n"
+
+        if [ $RUN_IN_FOREGROUND == ""]; then
+            printf "Running in the Background..\n"
         fi
+        # Start the DHCP Server Process once the Interface is Ready with the IP Add
+        udhcpd "${DHCP_CONFIG_PATH}" ${RUN_IN_FOREGROUND}
+
+
+    elif [ $1 == "STOP" ]; then
+        :
+        # pass
+        # kill_existing_dhcp_server ^^
     fi
 }
 
@@ -209,16 +261,28 @@ function usage() {
 
 
 ###############################################################################
-# FUNCTION: handleUsage
+# FUNCTION: handle_usage
 # DESCRIPTION: handle arguments
 ###############################################################################
-function handleUsage() {
+function handle_usage() {
 
-    while getopts ":uh" opt; do
+    while getopts ":ukbh" opt; do
         case ${opt} in
             u )
+                # uninstall everything
                 uninstall
                 exit;
+                ;;
+            k )
+                # kill an existing dhcp server
+                menu
+                control_c
+                # Kill existing dhcp server
+                # Close Ports
+                ;;
+            b )
+                RUN_IN_FOREGROUND=""
+                # run in the background
                 ;;
             h | * )
                 helpMenu
@@ -243,24 +307,26 @@ function main() {
        exit 1
     fi
 
-    handleUsage "$@"
+    handle_usage "$@"
 
     #Check to make sure everything is installed
-    checkInstall
+    check_install
 
-    choice=0
+    CHOICE=0
     #Get user input
     menu
 
     # Allow the firewall
-    ctrlFirewall "allow"
+    control_firewall "allow" 67
 
-    adapter=${adapters[choice]}
+    adapter=${ADAPTERS[CHOICE]}
     # updated config with option
-    sed -i "s/interface.*/interface ${adapter}/g" "${dhcp_config}" >> "${dhcp_config}"
+    sed -i "s,interface.*,interface ${adapter},g" "${DHCP_CONFIG_PATH}" >> "${DHCP_CONFIG_PATH}"
 
-    ctrlDhcp "stop"
-    ctrlDhcp "start"
+    sed -i "s,pidfile.*,pidfile /var/run/udhcpd.${adapter}.pid,g" "${DHCP_CONFIG_PATH}" >> "${DHCP_CONFIG_PATH}"
+
+    control_dhcp "stop"
+    control_dhcp "start"
    }
 
 #pass all arguments
